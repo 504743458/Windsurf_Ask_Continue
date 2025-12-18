@@ -514,17 +514,47 @@ function getWebviewContent(reason: string, requestId: string): string {
       border-color: var(--vscode-textLink-foreground, #3794ff);
       padding: 10px;
     }
-    .image-preview {
-      max-width: 100%;
-      max-height: 150px;
-      border-radius: 4px;
+    .images-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
       margin-bottom: 8px;
+    }
+    .image-item {
+      position: relative;
+      display: inline-block;
+    }
+    .image-preview {
+      max-width: 120px;
+      max-height: 100px;
+      border-radius: 4px;
+      object-fit: cover;
+    }
+    .remove-single {
+      position: absolute;
+      top: -6px;
+      right: -6px;
+      background: var(--vscode-errorForeground, #f14c4c);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 18px;
+      height: 18px;
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    .remove-single:hover {
+      opacity: 0.8;
     }
     .image-info {
       font-size: 11px;
       color: var(--vscode-descriptionForeground, #888888);
     }
-    .remove-image {
+    .remove-all {
       background: var(--vscode-button-secondaryBackground, #3a3d41);
       color: var(--vscode-button-secondaryForeground, #ffffff);
       border: none;
@@ -534,7 +564,7 @@ function getWebviewContent(reason: string, requestId: string): string {
       cursor: pointer;
       margin-top: 8px;
     }
-    .remove-image:hover {
+    .remove-all:hover {
       background: var(--vscode-button-secondaryHoverBackground, #45494e);
     }
   </style>
@@ -569,11 +599,11 @@ function getWebviewContent(reason: string, requestId: string): string {
         <label><input type="radio" name="uploadType" value="path"> 仅路径</label>
       </div>
       <div class="upload-hint" id="dropZone">
-        <span id="dropText">📋 Ctrl+V 粘贴图片 或 拖拽图片到此处</span>
+        <span id="dropText">📋 <span id="pasteKey">Ctrl</span>+V 粘贴图片 或 拖拽多张图片到此处 (支持多选)</span>
         <div id="imagePreviewContainer" style="display: none;">
-          <img id="imagePreview" class="image-preview" />
+          <div class="images-grid" id="imagesGrid"></div>
           <div class="image-info" id="imageInfo"></div>
-          <button type="button" class="remove-image" id="removeImage">✕ 移除图片</button>
+          <button type="button" class="remove-all" id="removeAllImages">✕ 移除全部图片</button>
         </div>
       </div>
     </div>
@@ -596,11 +626,18 @@ function getWebviewContent(reason: string, requestId: string): string {
     const dropZone = document.getElementById('dropZone');
     const dropText = document.getElementById('dropText');
     const imagePreviewContainer = document.getElementById('imagePreviewContainer');
-    const imagePreview = document.getElementById('imagePreview');
+    const imagesGrid = document.getElementById('imagesGrid');
     const imageInfo = document.getElementById('imageInfo');
-    const removeImageBtn = document.getElementById('removeImage');
+    const removeAllBtn = document.getElementById('removeAllImages');
     
-    let currentImageBase64 = null;
+    // 支持多张图片的数组
+    let imageList = [];
+    
+    // 检测Mac系统，更新快捷键提示
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0 || navigator.userAgent.toUpperCase().indexOf('MAC') >= 0;
+    if (isMac) {
+      document.getElementById('pasteKey').textContent = '⌘';
+    }
     
     // Focus textarea on load
     textarea.focus();
@@ -616,20 +653,23 @@ function getWebviewContent(reason: string, requestId: string): string {
       }
     });
     
-    // Handle paste event for images (Ctrl+V)
+    // Handle paste event for images (Ctrl+V / Cmd+V) - 支持粘贴多张图片
     document.addEventListener('paste', (e) => {
       const items = e.clipboardData?.items;
       if (!items) return;
       
+      let hasImage = false;
       for (const item of items) {
         if (item.type.startsWith('image/')) {
-          e.preventDefault();
+          hasImage = true;
           const file = item.getAsFile();
           if (file) {
             handleImageFile(file);
           }
-          break;
         }
+      }
+      if (hasImage) {
+        e.preventDefault();
       }
     });
     
@@ -642,12 +682,13 @@ function getWebviewContent(reason: string, requestId: string): string {
     
     dropZone.addEventListener('dragleave', (e) => {
       e.preventDefault();
-      if (!currentImageBase64) {
+      if (imageList.length === 0) {
         dropZone.style.borderColor = '';
         dropZone.style.backgroundColor = '';
       }
     });
     
+    // 拖拽放下 - 支持多张图片
     dropZone.addEventListener('drop', (e) => {
       e.preventDefault();
       dropZone.style.borderColor = '';
@@ -655,25 +696,67 @@ function getWebviewContent(reason: string, requestId: string): string {
       
       const files = e.dataTransfer?.files;
       if (files && files.length > 0) {
-        const file = files[0];
-        if (file.type.startsWith('image/')) {
-          handleImageFile(file);
+        // 遍历所有文件，处理每张图片
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          if (file.type.startsWith('image/')) {
+            handleImageFile(file);
+          }
         }
       }
     });
     
-    // Handle image file
+    // 处理单个图片文件 - 添加到图片列表
     function handleImageFile(file) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        currentImageBase64 = e.target.result;
-        imagePreview.src = currentImageBase64;
-        imageInfo.textContent = file.name + ' (' + formatFileSize(file.size) + ')';
+        const imageData = {
+          base64: e.target.result,
+          name: file.name,
+          size: file.size,
+          id: Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+        };
+        imageList.push(imageData);
+        updateImagePreview();
+      };
+      reader.readAsDataURL(file);
+    }
+    
+    // 更新图片预览区域
+    function updateImagePreview() {
+      if (imageList.length === 0) {
+        dropText.style.display = 'block';
+        imagePreviewContainer.style.display = 'none';
+        dropZone.classList.remove('has-image');
+        imagesGrid.innerHTML = '';
+        imageInfo.textContent = '';
+      } else {
         dropText.style.display = 'none';
         imagePreviewContainer.style.display = 'block';
         dropZone.classList.add('has-image');
-      };
-      reader.readAsDataURL(file);
+        
+        // 生成图片预览HTML
+        imagesGrid.innerHTML = imageList.map((img, index) => 
+          '<div class="image-item" data-id="' + img.id + '">' +
+            '<img src="' + img.base64 + '" class="image-preview" title="' + img.name + '" />' +
+            '<button type="button" class="remove-single" data-index="' + index + '">✕</button>' +
+          '</div>'
+        ).join('');
+        
+        // 显示图片数量和总大小
+        const totalSize = imageList.reduce((sum, img) => sum + img.size, 0);
+        imageInfo.textContent = '共 ' + imageList.length + ' 张图片 (' + formatFileSize(totalSize) + ')';
+        
+        // 绑定单个删除按钮事件
+        imagesGrid.querySelectorAll('.remove-single').forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const index = parseInt(btn.getAttribute('data-index'));
+            imageList.splice(index, 1);
+            updateImagePreview();
+          });
+        });
+      }
     }
     
     // Format file size
@@ -683,15 +766,11 @@ function getWebviewContent(reason: string, requestId: string): string {
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
     
-    // Remove image
-    removeImageBtn.addEventListener('click', (e) => {
+    // 移除全部图片
+    removeAllBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      currentImageBase64 = null;
-      imagePreview.src = '';
-      imageInfo.textContent = '';
-      dropText.style.display = 'block';
-      imagePreviewContainer.style.display = 'none';
-      dropZone.classList.remove('has-image');
+      imageList = [];
+      updateImagePreview();
     });
     
     // Button handlers
@@ -701,15 +780,18 @@ function getWebviewContent(reason: string, requestId: string): string {
     function submitContinue() {
       let text = textarea.value.trim();
       
-      // If there's an image, append it to the message
-      if (currentImageBase64) {
+      // 如果有图片，将所有图片附加到消息中
+      if (imageList.length > 0) {
         const uploadType = document.querySelector('input[name="uploadType"]:checked')?.value || 'base64';
         if (uploadType === 'base64') {
-          text = (text ? text + '\\n\\n' : '') + '[图片已附加]\\n' + currentImageBase64;
+          const imagesText = imageList.map((img, i) => 
+            '[图片 ' + (i + 1) + ': ' + img.name + ']\\n' + img.base64
+          ).join('\\n\\n');
+          text = (text ? text + '\\n\\n' : '') + imagesText;
         }
       }
       
-      vscode.postMessage({ command: 'continue', text: text || '继续', hasImage: !!currentImageBase64 });
+      vscode.postMessage({ command: 'continue', text: text || '继续', hasImage: imageList.length > 0, imageCount: imageList.length });
     }
     
     function submitEnd() {
