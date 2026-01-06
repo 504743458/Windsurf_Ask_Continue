@@ -50,17 +50,21 @@ set "WINDSURF_MCP_FILE=%WINDSURF_MCP_DIR%\mcp_config.json"
 :: 创建目录（如果不存在）
 if not exist "%WINDSURF_MCP_DIR%" mkdir "%WINDSURF_MCP_DIR%"
 
-:: 写入 MCP 配置
-echo {> "%WINDSURF_MCP_FILE%"
-echo   "mcpServers": {>> "%WINDSURF_MCP_FILE%"
-echo     "ask-continue": {>> "%WINDSURF_MCP_FILE%"
-echo       "command": "python",>> "%WINDSURF_MCP_FILE%"
-echo       "args": ["%SERVER_PATH%"]>> "%WINDSURF_MCP_FILE%"
-echo     }>> "%WINDSURF_MCP_FILE%"
-echo   }>> "%WINDSURF_MCP_FILE%"
-echo }>> "%WINDSURF_MCP_FILE%"
+:: 备份并合并写入 MCP 配置（避免覆盖用户现有 MCP 配置）
+if exist "%WINDSURF_MCP_FILE%" (
+    copy "%WINDSURF_MCP_FILE%" "%WINDSURF_MCP_FILE%.backup" >nul 2>&1
+    echo [备份] 旧 MCP 配置已备份到: %WINDSURF_MCP_FILE%.backup
+)
 
-echo [OK] MCP 配置已写入: %WINDSURF_MCP_FILE%
+python -c "import json,pathlib; p=pathlib.Path(r'%WINDSURF_MCP_FILE%'); t=p.read_text(encoding='utf-8') if p.exists() else ''; data=json.loads(t) if t.strip() else {}; data=data if isinstance(data,dict) else {}; m=data.get('mcpServers'); m=m if isinstance(m,dict) else {}; m['ask-continue']={'command':'python','args':[r'%SERVER_PATH%']}; data['mcpServers']=m; p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')"
+if errorlevel 1 (
+    echo [错误] MCP 配置合并写入失败
+    if exist "%WINDSURF_MCP_FILE%.backup" copy /Y "%WINDSURF_MCP_FILE%.backup" "%WINDSURF_MCP_FILE%" >nul 2>&1
+    pause
+    exit /b 1
+)
+
+echo [OK] MCP 配置已更新: %WINDSURF_MCP_FILE%
 
 :: 安装 VS Code 扩展
 echo.
@@ -89,13 +93,22 @@ set "RULES_DST=%USERPROFILE%\.windsurfrules"
 if not exist "%RULES_SRC%" (
     echo [警告] 规则模板文件不存在: %RULES_SRC%
 ) else (
-    if exist "%RULES_DST%" (
-        :: 备份旧文件
-        copy "%RULES_DST%" "%RULES_DST%.backup" >nul 2>&1
-        echo [备份] 旧规则已备份到: %RULES_DST%.backup
+    if not exist "%RULES_DST%" (
+        copy /Y "%RULES_SRC%" "%RULES_DST%" >nul
+        echo [OK] 全局规则已创建: %RULES_DST%
+    ) else (
+        findstr /C:"<ask_continue_protocol>" "%RULES_DST%" >nul
+        if errorlevel 1 (
+            copy "%RULES_DST%" "%RULES_DST%.backup" >nul 2>&1
+            echo [备份] 旧规则已备份到: %RULES_DST%.backup
+            echo.>> "%RULES_DST%"
+            echo.>> "%RULES_DST%"
+            type "%RULES_SRC%" >> "%RULES_DST%"
+            echo [OK] Ask Continue 规则已追加到: %RULES_DST%
+        ) else (
+            echo [跳过] 全局规则已包含 Ask Continue 协议: %RULES_DST%
+        )
     )
-    copy /Y "%RULES_SRC%" "%RULES_DST%" >nul
-    echo [OK] 全局规则已更新: %RULES_DST%
 )
 
 echo.

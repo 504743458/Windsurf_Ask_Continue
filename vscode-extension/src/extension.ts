@@ -58,6 +58,23 @@ class StatusViewProvider implements vscode.WebviewViewProvider {
         case "openPanel":
           vscode.commands.executeCommand("askContinue.openPanel");
           break;
+        case "resetPipeline":
+          vscode.commands.executeCommand("askContinue.resetPipeline");
+          break;
+        case "toggleMode":
+          // 切换窗口模式
+          const config = vscode.workspace.getConfiguration("askContinue");
+          const currentMode = config.get<string>("windowMode", "single");
+          const newMode = currentMode === "single" ? "multi" : "single";
+          config.update("windowMode", newMode, vscode.ConfigurationTarget.Global).then(() => {
+            // 更新面板显示
+            if (this._view) {
+              this._view.webview.html = this._getHtmlContent();
+            }
+            const modeText = newMode === "single" ? "单窗口模式" : "多窗口模式";
+            vscode.window.showInformationMessage(`Ask Continue: 已切换到${modeText}`);
+          });
+          break;
       }
     });
   }
@@ -81,6 +98,13 @@ class StatusViewProvider implements vscode.WebviewViewProvider {
     const statusIcon = this._serverRunning ? "🟢" : "🔴";
     const statusText = this._serverRunning ? "运行中" : "已停止";
     const statusClass = this._serverRunning ? "running" : "stopped";
+    
+    // 读取窗口模式配置
+    const config = vscode.workspace.getConfiguration("askContinue");
+    const windowMode = config.get<string>("windowMode", "single");
+    const modeIcon = windowMode === "single" ? "🖥️" : "🖼️";
+    const modeText = windowMode === "single" ? "单窗口模式" : "多窗口模式";
+    const modeClass = windowMode === "single" ? "single-mode" : "multi-mode";
 
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -145,6 +169,34 @@ class StatusViewProvider implements vscode.WebviewViewProvider {
     .btn:hover {
       background: var(--vscode-button-hoverBackground);
     }
+    .btn-warning {
+      background: #cc6600;
+      color: white;
+    }
+    .btn-warning:hover {
+      background: #dd7700;
+    }
+    .single-mode {
+      color: #4ec9b0;
+    }
+    .multi-mode {
+      color: #dcdcaa;
+    }
+    .mode-desc {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      margin-top: 4px;
+      line-height: 1.4;
+    }
+    .btn-mode {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      margin-top: 8px;
+      font-size: 11px;
+    }
+    .btn-mode:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
     .info-box {
       background: var(--vscode-textBlockQuote-background);
       border-left: 3px solid var(--vscode-textLink-foreground);
@@ -177,13 +229,26 @@ class StatusViewProvider implements vscode.WebviewViewProvider {
       <span class="label">对话次数</span>
       <span class="value">${this._requestCount}</span>
     </div>
+    <div class="status-row">
+      <span class="label">窗口模式</span>
+      <span class="value ${modeClass}">${modeIcon} ${modeText}</span>
+    </div>
+    <div class="mode-desc">
+      ${windowMode === "single" 
+        ? "✅ 单窗口模式：失去焦点也会弹窗，永久保留对话功能" 
+        : "⚠️ 多窗口模式：仅在焦点窗口弹窗，超时可能导致无法对话"}
+    </div>
+    <button class="btn btn-mode" onclick="toggleMode()">🔄 切换到${windowMode === "single" ? "多窗口" : "单窗口"}模式</button>
   </div>
   
   <button class="btn btn-primary" onclick="openPanel()">📋 重新打开对话弹窗</button>
+  <button class="btn btn-warning" onclick="resetPipeline()">🔧 通道堵塞？点此重置</button>
   <button class="btn" onclick="restart()">🔄 重启服务</button>
   
   <div class="info-box">
-    <strong>提示:</strong> 如果不小心关闭了对话弹窗，点击上方按钮重新打开。
+    <strong>提示:</strong><br>
+    • 关闭弹窗后可重新打开继续回复<br>
+    • 如果 AI 长时间无响应，可能是通道堵塞，点击"通道堵塞"按钮重置
   </div>
   
   <script>
@@ -191,8 +256,14 @@ class StatusViewProvider implements vscode.WebviewViewProvider {
     function openPanel() {
       vscode.postMessage({ command: 'openPanel' });
     }
+    function resetPipeline() {
+      vscode.postMessage({ command: 'resetPipeline' });
+    }
     function restart() {
       vscode.postMessage({ command: 'restart' });
+    }
+    function toggleMode() {
+      vscode.postMessage({ command: 'toggleMode' });
     }
   </script>
 </body>
@@ -230,9 +301,14 @@ async function sendResponseToMCP(
         timeout: 5000,
       },
       (res) => {
-        if (res.statusCode === 200 || res.statusCode === 404) {
-          // 200 = 成功, 404 = 请求已过期/不存在（静默处理）
+        if (res.statusCode === 200) {
           resolve();
+        } else if (res.statusCode === 404) {
+          reject(
+            new Error(
+              `MCP server returned 404 (Request not found). requestId=${requestId}`
+            )
+          );
         } else {
           reject(new Error(`MCP server returned status ${res.statusCode}`));
         }
@@ -241,6 +317,11 @@ async function sendResponseToMCP(
 
     req.on("error", (e) => {
       reject(new Error(`Failed to send response to MCP: ${e.message}`));
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Failed to send response to MCP: request timeout"));
     });
 
     req.write(postData);
@@ -256,6 +337,8 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
   lastPendingRequest = request;
   lastPendingRequestTime = Date.now();
   
+  console.log(`[Ask Continue] 正在创建对话框, requestId=${request.requestId}`);
+  
   let panel: vscode.WebviewPanel;
   try {
     panel = vscode.window.createWebviewPanel(
@@ -267,6 +350,7 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
       retainContextWhenHidden: true,
     }
   );
+  console.log(`[Ask Continue] 对话框创建成功`);
 
   panel.webview.html = getWebviewContent(request.reason, request.requestId);
   } catch (err) {
@@ -294,8 +378,8 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
         case "continue":
           try {
             responseSent = true;
-            lastPendingRequest = null; // 清除待处理请求
             await sendResponseToMCP(request.requestId, message.text, false, request.callbackPort);
+            lastPendingRequest = null; // 清除待处理请求
             panel.dispose();
           } catch (error) {
             responseSent = false;
@@ -308,6 +392,7 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
           try {
             responseSent = true;
             await sendResponseToMCP(request.requestId, "", false, request.callbackPort);
+            lastPendingRequest = null; // 清除待处理请求
             panel.dispose();
           } catch (error) {
             responseSent = false;
@@ -320,6 +405,7 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
           try {
             responseSent = true;
             await sendResponseToMCP(request.requestId, "", true, request.callbackPort);
+            lastPendingRequest = null; // 清除待处理请求
             panel.dispose();
           } catch (error) {
             // Ignore errors on cancel
@@ -331,18 +417,12 @@ async function showAskContinueDialog(request: AskRequest): Promise<void> {
     []
   );
 
-  // Handle panel close (treat as cancel only if no response sent yet)
+  // Handle panel close - 关闭面板时不发送取消，保留请求等待用户重新打开
+  // 用户可以通过状态面板的"重新打开对话弹窗"或"通道堵塞"按钮继续
   panel.onDidDispose(async () => {
-    // 清除待处理请求（无论是否已发送响应）
-    if (lastPendingRequest?.requestId === request.requestId) {
-      lastPendingRequest = null;
-    }
-    if (responseSent) return;
-    try {
-      await sendResponseToMCP(request.requestId, "", true, request.callbackPort);
-    } catch {
-      // Ignore errors on dispose
-    }
+    // 不清除待处理请求，让用户可以重新打开面板继续回复
+    // lastPendingRequest 保留，用于"重新打开对话弹窗"功能
+    // 不发送 cancelled:true，MCP 会继续等待
   });
 }
 
@@ -851,6 +931,28 @@ function startServer(port: number, retryCount = 0): void {
           if (request.type === "ask_continue") {
             // Show dialog with error handling
             try {
+              // 即使窗口未聚焦，也保存请求，方便用户切回后手动打开
+              lastPendingRequest = request;
+              lastPendingRequestTime = Date.now();
+              
+              // 读取窗口模式配置
+              const config = vscode.workspace.getConfiguration("askContinue");
+              const windowMode = config.get<string>("windowMode", "single");
+              console.log(`[Ask Continue] 收到请求 ${request.requestId}, windowMode=${windowMode}, focused=${vscode.window.state.focused}`);
+              
+              // 多窗口模式：检查焦点，未聚焦时返回 409
+              // 单窗口模式：忽略焦点检查，直接弹窗
+              if (windowMode === "multi" && !vscode.window.state.focused) {
+                res.writeHead(409, { "Content-Type": "application/json" });
+                res.end(
+                  JSON.stringify({
+                    error: "Window not focused",
+                    details: "Ask Continue popup should show in the focused window (multi-window mode)",
+                  })
+                );
+                return;
+              }
+
               // 使用 await 确保 webview 创建完成
               await showAskContinueDialog(request);
               
@@ -946,7 +1048,9 @@ async function cleanupOldMcpProcesses(): Promise<void> {
   const isWindows = process.platform === "win32";
   
   // 清理端口 23984-24034 范围内的旧进程（MCP 回调端口范围）
-  for (let port = 23984; port <= 24034; port++) {
+  const startPort = MCP_CALLBACK_PORT;
+  const endPort = MCP_CALLBACK_PORT;
+  for (let port = startPort; port <= endPort; port++) {
     try {
       if (isWindows) {
         // Windows: 查找并结束占用端口的进程
@@ -957,9 +1061,22 @@ async function cleanupOldMcpProcesses(): Promise<void> {
               const parts = line.trim().split(/\s+/);
               const pid = parts[parts.length - 1];
               if (pid && /^\d+$/.test(pid) && pid !== process.pid.toString()) {
-                exec(`taskkill /F /PID ${pid}`, () => {
-                  console.log(`[Ask Continue] Killed old MCP process on port ${port} (PID: ${pid})`);
-                });
+                exec(
+                  `wmic process where "ProcessId=${pid}" get CommandLine /value`,
+                  (_cmdErr: unknown, cmdStdout: string) => {
+                    const commandLine = (cmdStdout || "").toLowerCase();
+                    const shouldKill =
+                      commandLine.includes("windsurf_ask_continue") ||
+                      commandLine.includes("mcp-server-python") ||
+                      commandLine.includes("ask_continue");
+                    if (!shouldKill) return;
+                    exec(`taskkill /F /PID ${pid}`, () => {
+                      console.log(
+                        `[Ask Continue] Killed old MCP process on port ${port} (PID: ${pid})`
+                      );
+                    });
+                  }
+                );
               }
             }
           }
@@ -971,8 +1088,18 @@ async function cleanupOldMcpProcesses(): Promise<void> {
             const pids = stdout.trim().split('\n');
             for (const pid of pids) {
               if (pid && pid !== process.pid.toString()) {
-                exec(`kill -9 ${pid}`, () => {
-                  console.log(`[Ask Continue] Killed old MCP process on port ${port} (PID: ${pid})`);
+                exec(`ps -p ${pid} -o command=`, (_cmdErr: unknown, cmdStdout: string) => {
+                  const commandLine = (cmdStdout || "").toLowerCase();
+                  const shouldKill =
+                    commandLine.includes("windsurf_ask_continue") ||
+                    commandLine.includes("mcp-server-python") ||
+                    commandLine.includes("ask_continue");
+                  if (!shouldKill) return;
+                  exec(`kill -9 ${pid}`, () => {
+                    console.log(
+                      `[Ask Continue] Killed old MCP process on port ${port} (PID: ${pid})`
+                    );
+                  });
                 });
               }
             }
@@ -1089,9 +1216,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("askContinue.openPanel", () => {
+      console.log(`[Ask Continue] openPanel 被调用, lastPendingRequest=${lastPendingRequest ? lastPendingRequest.requestId : 'null'}`);
       if (lastPendingRequest) {
-        // 检查请求是否过期（10分钟）
-        const REQUEST_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+        // 检查请求是否过期（24小时）- 配合 MCP 无限等待设计
+        const REQUEST_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
         if (Date.now() - lastPendingRequestTime > REQUEST_TIMEOUT) {
           lastPendingRequest = null;
           vscode.window.showWarningMessage("Ask Continue: 待处理的请求已过期");
@@ -1100,6 +1228,36 @@ export function activate(context: vscode.ExtensionContext): void {
         showAskContinueDialog(lastPendingRequest);
       } else {
         vscode.window.showInformationMessage("Ask Continue: 没有待处理的对话请求");
+      }
+    })
+  );
+
+  // 通道堵塞重置命令 - 清除待处理请求并通知 MCP
+  context.subscriptions.push(
+    vscode.commands.registerCommand("askContinue.resetPipeline", async () => {
+      if (lastPendingRequest) {
+        const request = lastPendingRequest;
+        lastPendingRequest = null;
+        lastPendingRequestTime = 0;
+        
+        // 向 MCP 发送特殊的重置信号（userInput 包含重置标记）
+        try {
+          await sendResponseToMCP(
+            request.requestId,
+            "[PIPELINE_RESET] 用户通过扩展状态面板重置了对话管道。请重新调用 ask_continue 工具。",
+            false,  // 不是取消，是重置
+            request.callbackPort
+          );
+          vscode.window.showInformationMessage(
+            "Ask Continue: 对话管道已重置。AI 将收到重置通知，请等待 AI 重新调用 ask_continue。"
+          );
+        } catch (error) {
+          vscode.window.showWarningMessage(
+            "Ask Continue: 管道重置完成，但无法通知 MCP（可能已断开）。请在聊天中告知 AI 重新调用 ask_continue。"
+          );
+        }
+      } else {
+        vscode.window.showInformationMessage("Ask Continue: 当前没有堵塞的对话管道");
       }
     })
   );
@@ -1118,7 +1276,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Watch for configuration changes
   context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
+    vscode.workspace.onDidChangeConfiguration((e: vscode.ConfigurationChangeEvent) => {
       if (e.affectsConfiguration("askContinue.serverPort")) {
         const newPort = vscode.workspace
           .getConfiguration("askContinue")
@@ -1127,12 +1285,26 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     })
   );
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((e) => {
+      if (!e.focused) return;
+      if (!server || !server.listening) return;
+      const addr = server.address();
+      const port =
+        typeof addr === "object" && addr && "port" in addr
+          ? (addr.port as number)
+          : vscode.workspace.getConfiguration("askContinue").get<number>("serverPort", 23983);
+      writePortFile(port);
+    })
+  );
 }
 
 /**
  * Extension deactivation
  */
 export function deactivate(): void {
+  cleanupPortFile();
   if (server) {
     server.close();
     server = null;

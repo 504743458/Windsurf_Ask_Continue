@@ -79,6 +79,16 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically start the server when Windsurf opens"
+        },
+        "askContinue.windowMode": {
+          "type": "string",
+          "enum": ["single", "multi"],
+          "default": "single",
+          "enumDescriptions": [
+            "单窗口模式（强烈推荐）：更加稳定，失去焦点时也会弹出对话框，永久保留继续对话功能，不会因长时间未响应导致 MCP 无法发出对话",
+            "多窗口模式：启用 409 焦点检查，确保多开对话时弹窗只在焦点窗口展开。但超过 30 秒未响应可能导致 Windsurf 取消 MCP 调用，无法发送对话"
+          ],
+          "description": "窗口模式选择：单窗口模式更稳定，多窗口模式适合多开 Windsurf 的场景"
         }
       }
     }
